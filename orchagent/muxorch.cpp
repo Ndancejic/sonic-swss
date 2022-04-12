@@ -23,6 +23,7 @@
 #include "aclorch.h"
 #include "routeorch.h"
 #include "fdborch.h"
+#include "bulker.h"
 
 /* Global variables */
 extern Directory<Orch*> gDirectory;
@@ -40,6 +41,8 @@ extern sai_route_api_t* sai_route_api;
 extern sai_tunnel_api_t* sai_tunnel_api;
 extern sai_next_hop_api_t* sai_next_hop_api;
 extern sai_router_interface_api_t* sai_router_intfs_api;
+
+extern size_t gMaxBulkSize;
 
 /* Constants */
 #define MUX_TUNNEL "MuxTunnel0"
@@ -91,6 +94,47 @@ static inline MuxStateChange mux_state_change (MuxState prev, MuxState curr)
     }
 
     return MuxStateChange::MUX_STATE_UNKNOWN_STATE;
+}
+
+static sai_status_t add_bulker_route(IpPrefix &pfx, sai_object_id_t nh, ObjectBulker<sai_next_hop_group_api_t> bulker)
+{
+    sai_status_t object_status; // need to make this a list
+    sai_route_entry_t route_entry;
+    route_entry.switch_id = gSwitchId;
+    route_entry.vr_id = gVirtualRouterId;
+    copy(route_entry.destination, pfx);
+    subnet(route_entry.destination, route_entry.destination);
+
+    sai_attribute_t attr;
+    vector<sai_attribute_t> attrs;
+
+    attr.id = SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION;
+    attr.value.s32 = SAI_PACKET_ACTION_FORWARD;
+    attrs.push_back(attr);
+
+    attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+    attr.value.oid = nh;
+    attrs.push_back(attr);
+
+    sai_status_t status = bulker.create_entry(object_status, &route_entry, (uint32_t)attrs.size(), attrs.data());
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to add bulker entry %s,nh %" PRIx64 " rv:%d",
+                pfx.getIp().to_string().c_str(), nh, status);
+        return status;
+    }
+
+    if (route_entry.destination.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+    {
+        gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV4_ROUTE);
+    }
+    else
+    {
+        gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_IPV6_ROUTE);
+    }
+
+    SWSS_LOG_NOTICE("Created tunnel route to %s ", pfx.to_string().c_str());
+    return status;
 }
 
 static sai_status_t create_route(IpPrefix &pfx, sai_object_id_t nh)
@@ -634,6 +678,9 @@ bool MuxNbrHandler::disable(sai_object_id_t tnh)
     NeighborEntry neigh;
     MuxCableOrch* mux_cb_orch = gDirectory.get<MuxCableOrch*>();
 
+    ObjectBulker<sai_next_hop_group_api_t>  gRouteBulker;
+    gRouteBulker(sai_route_api, gMaxBulkSize);
+
     auto it = neighbors_.begin();
     while (it != neighbors_.end())
     {
@@ -681,13 +728,15 @@ bool MuxNbrHandler::disable(sai_object_id_t tnh)
         mux_cb_orch->addTunnelRoute(nh_key);
 
         IpPrefix pfx = it->first.to_string();
-        if (create_route(pfx, it->second) != SAI_STATUS_SUCCESS)
+        if (add_bulker_route(pfx, it->second) != SAI_STATUS_SUCCESS, gRouteBulker))
         {
             return false;
         }
 
         it++;
     }
+
+    gRouteBulker.flush();
 
     return true;
 }
